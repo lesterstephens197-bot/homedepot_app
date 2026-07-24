@@ -1,3 +1,4 @@
+import json
 import re
 import requests
 import streamlit as st
@@ -15,9 +16,9 @@ def extract_item_id(url: str) -> str:
     return None
 
 
-def fetch_from_bazaarvoice(item_id: str):
-    """方式一：通过 Bazaarvoice API 获取"""
-    api_url = "https://api.bazaarvoice.com/data/batch.json"
+def fetch_bazaarvoice_data(item_id: str):
+    """请求 Bazaarvoice API (针对 THD 的标准评价数据源)"""
+    url = "https://api.bazaarvoice.com/data/batch.json"
     params = {
         "passkey": "ca3E98M1vS4N6oF1e5P5k349",
         "apiversion": "5.5",
@@ -26,94 +27,57 @@ def fetch_from_bazaarvoice(item_id: str):
         "filter.q0": f"id:{item_id}",
         "stats.q0": "reviews",
     }
+
+    # 模拟真实浏览器 Header
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.homedepot.com/",
     }
 
-    res = requests.get(api_url, params=params, headers=headers, timeout=8)
-    if res.status_code != 200:
-        return None, None
-
-    data = res.json()
-    results = data.get("BatchedResults", {}).get("q0", {}).get("Results", [])
-    if not results:
-        return None, None
-
-    prod_data = results[0]
-    review_stats = prod_data.get("ReviewStatistics", {})
-    total_reviews = review_stats.get("TotalReviewCount", 0)
-
-    rating_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
-    for dist in review_stats.get("RatingDistribution", []):
-        val = dist.get("RatingValue")
-        count = dist.get("Count")
-        if val in rating_counts:
-            rating_counts[val] = count
-
-    return total_reviews, rating_counts
-
-
-def fetch_from_thd_graphql(item_id: str):
-    """方式二：备用 - 通过 Home Depot 官方 GraphQL 接口获取"""
-    url = "https://www.homedepot.com/graphql"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Content-Type": "application/json",
-        "x-experience-name": "responsive",
-    }
-    query = """
-    query GetProductReviews($itemId: String!) {
-        product(itemId: $itemId) {
-            reviews {
-                ratingsReviews {
-                    aggregate {
-                        reviewCount
-                        ratingDistribution {
-                            rating
-                            count
-                        }
-                    }
-                }
-            }
-        }
-    }
-    """
     try:
-        res = requests.post(
-            url,
-            json={"query": query, "variables": {"itemId": item_id}},
-            headers=headers,
-            timeout=8,
+        res = requests.get(url, params=params, headers=headers, timeout=10)
+        if res.status_code != 200:
+            return None, f"HTTP Error {res.status_code}"
+
+        data = res.json()
+        results = (
+            data.get("BatchedResults", {})
+            .get("q0", {})
+            .get("Results", [])
         )
-        if res.status_code == 200:
-            data = res.json()
-            agg = (
-                data.get("data", {})
-                .get("product", {})
-                .get("reviews", {})
-                .get("ratingsReviews", {})
-                .get("aggregate", {})
-            )
-            total = agg.get("reviewCount", 0)
-            dist_list = agg.get("ratingDistribution", [])
 
-            rating_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
-            for item in dist_list:
-                r = item.get("rating")
-                c = item.get("count", 0)
-                if r in rating_counts:
-                    rating_counts[r] = c
+        if not results:
+            return None, "未找到该商品的评价数据"
 
-            return total, rating_counts
-    except Exception:
-        pass
-    return None, None
+        prod_info = results[0]
+        review_stats = prod_info.get("ReviewStatistics", {})
+        total_count = review_stats.get("TotalReviewCount", 0)
+
+        # 提取 1-5 星分布
+        rating_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
+        distribution = review_stats.get("RatingDistribution", [])
+
+        for item in distribution:
+            val = item.get("RatingValue")
+            cnt = item.get("Count", 0)
+            if val in rating_counts:
+                rating_counts[val] = cnt
+
+        return {"total": total_count, "ratings": rating_counts}, None
+
+    except Exception as e:
+        return None, str(e)
 
 
-# --- Streamlit UI 界面 ---
+# --- UI 界面 ---
 st.title("🛍️ Home Depot 评论星级抓取工具")
-st.markdown("输入 Home Depot 商品链接，快速查询 1~5 星评论分布数据。")
+st.markdown("输入 Home Depot 商品链接，查询 1~5 星评论分布数据。")
 
 target_url = st.text_input(
     "商品链接 (Product URL):",
@@ -127,40 +91,30 @@ if st.button("开始查询", type="primary"):
         item_id = extract_item_id(target_url)
 
         if not item_id:
-            st.error("未能识别出有效的商品 ID，请检查链接格式。")
+            st.error("无法识别出有效的商品 ID，请检查链接格式是否包含数字 ID（如 336986711）。")
         else:
-            with st.spinner("正在查询数据中..."):
-                # 先尝试 Bazaarvoice API
-                total_reviews, rating_counts = fetch_from_bazaarvoice(item_id)
+            with st.spinner("正在获取数据中..."):
+                result, error = fetch_bazaarvoice_data(item_id)
 
-                # 如果 Bazaarvoice 未查到，尝试官方 GraphQL API
-                if total_reviews is None:
-                    total_reviews, rating_counts = fetch_from_thd_graphql(
-                        item_id
-                    )
-
-                # 结果显示逻辑
-                if total_reviews is None:
-                    st.error("无法获取该商品数据，请确认链接是否正确。")
-                elif total_reviews == 0:
-                    st.info(
-                        f"解析成功（商品 ID: `{item_id}`），但该商品当前**暂无任何买家评论**。"
-                    )
+                if error:
+                    st.error(f"查询失败: {error}")
+                elif result["total"] == 0:
+                    st.info(f"解析成功（商品 ID: `{item_id}`），但 API 返回该商品**评论总数为 0**。请检查该商品在官网页面上是否真的有买家评价。")
                 else:
                     st.success(f"解析成功！商品 ID: `{item_id}`")
-                    st.metric("总评论数", f"{total_reviews} 条")
+                    st.metric("总评论数", f"{result['total']} 条")
 
                     st.subheader("📊 星级分布明细")
 
+                    # 显示 5 列指标
                     cols = st.columns(5)
                     stars = [5, 4, 3, 2, 1]
                     for idx, star in enumerate(stars):
-                        cols[idx].metric(
-                            f"{star} 星", f"{rating_counts[star]} 条"
-                        )
+                        cols[idx].metric(f"{star} 星", f"{result['ratings'][star]} 条")
 
+                    # 图表显示
                     chart_data = {
                         "星级": [f"{i} 星" for i in range(1, 6)],
-                        "评论数": [rating_counts[i] for i in range(1, 6)],
+                        "评论数": [result["ratings"][i] for i in range(1, 6)],
                     }
                     st.bar_chart(data=chart_data, x="星级", y="评论数")
