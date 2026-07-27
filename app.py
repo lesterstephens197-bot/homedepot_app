@@ -1,178 +1,124 @@
-import re
-import requests
 import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
-st.set_page_config(
-    page_title="Home Depot 评论星级抓取工具", page_icon="🛍️", layout="centered"
-)
+st.set_page_config(page_title="Home Depot SKU Daily Sales Analytics", layout="wide")
 
+st.title("📦 Home Depot 产品 SKU 深度日均销量看板")
 
-def extract_item_id(url: str) -> str:
-    """从 Home Depot 的商品链接中提取 itemId/productId"""
-    match = re.search(r"/(\d{8,10})(?:\?|\#|$)", url)
-    if match:
-        return match.group(1)
-    return None
+# 1. 侧边栏文件上传与设置
+uploaded_file = st.sidebar.file_uploader("上传 Home Depot 销售报表 (CSV/Excel)", type=["csv", "xlsx"])
 
+if uploaded_file:
+    # 读取数据
+    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
+    
+    # 规范化列名与类型 (适应 Supplier Hub / Analytics 常见导出格式)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Units Sold'] = pd.to_numeric(df['Units Sold'], errors='coerce').fillna(0)
+    df['Net Sales'] = pd.to_numeric(df['Net Sales'], errors='coerce').fillna(0)
+    
+    # 库存列 (若无则默认为 1 以防报错)
+    if 'OnHand Inventory' not in df.columns:
+        df['OnHand Inventory'] = 1
+        
+    # 渠道列 (如 Online / In-Store)
+    if 'Channel' not in df.columns:
+        df['Channel'] = 'All Channels'
 
-def fetch_via_thd_graphql(item_id: str):
-    """方法 1：通过 Home Depot 官方 GraphQL 获取评价数据"""
-    url = "https://www.homedepot.com/graphql"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Content-Type": "application/json",
-        "x-experience-name": "responsive",
-    }
+    # 2. SKU 选择器
+    sku_list = df['SKU'].unique()
+    selected_sku = st.sidebar.selectbox("选择产品 SKU / Internet #", sku_list)
+    
+    # 时间范围
+    min_date, max_date = df['Date'].min(), df['Date'].max()
+    date_range = st.sidebar.date_input("分析区间", [min_date, max_date])
+    
+    # 过滤单 SKU 数据
+    sku_data = df[(df['SKU'] == selected_sku) & 
+                   (df['Date'] >= pd.to_datetime(date_range[0])) & 
+                   (df['Date'] <= pd.to_datetime(date_range[1]))].sort_values('Date')
+    
+    if not sku_data.empty:
+        # 按日期汇总（防止同一天多条渠道记录）
+        daily_summary = sku_data.groupby('Date').agg({
+            'Units Sold': 'sum',
+            'Net Sales': 'sum',
+            'OnHand Inventory': 'sum'
+        }).reset_index()
 
-    query = """
-    query GetProductReviews($itemId: String!) {
-        product(itemId: $itemId) {
-            reviews {
-                ratingsReviews {
-                    aggregate {
-                        reviewCount
-                        ratingDistribution {
-                            rating
-                            count
-                        }
-                    }
-                }
-            }
-        }
-    }
-    """
+        # 计算不同情况下的日均
+        total_days = (daily_summary['Date'].max() - daily_summary['Date'].min()).days + 1
+        total_units = daily_summary['Units Sold'].sum()
+        
+        # 剔除库存为0且无销量的断货天数 (OOS)
+        in_stock_days_df = daily_summary[(daily_summary['OnHand Inventory'] > 0) | (daily_summary['Units Sold'] > 0)]
+        in_stock_days = len(in_stock_days_df)
+        
+        overall_avg = total_units / total_days if total_days > 0 else 0
+        instock_avg = total_units / in_stock_days if in_stock_days > 0 else 0
 
-    try:
-        response = requests.post(
-            url,
-            json={"query": query, "variables": {"itemId": item_id}},
-            headers=headers,
-            timeout=8,
+        # 计算滑动平均
+        daily_summary['7D_Avg'] = daily_summary['Units Sold'].rolling(7, min_periods=1).mean()
+        daily_summary['14D_Avg'] = daily_summary['Units Sold'].rolling(14, min_periods=1).mean()
+        daily_summary['30D_Avg'] = daily_summary['Units Sold'].rolling(30, min_periods=1).mean()
+
+        # 3. 核心指标卡片
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("累计总销量", f"{int(total_units):,} 件")
+        col2.metric("全时段日均 (Overall)", f"{overall_avg:.1f} 件/天")
+        col3.metric("在售无断货日均 (In-Stock Avg)", f"{instock_avg:.1f} 件/天", 
+                    delta=f"{instock_avg - overall_avg:+.1f} (剔除断货干扰)", delta_color="normal")
+        col4.metric("近 14 日动销日均", f"{daily_summary['14D_Avg'].iloc[-1]:.1f} 件/天")
+
+        st.divider()
+
+        # 4. 图表展示：日销量 + 断货区间 + 趋势线
+        st.subheader("📈 产品 SKU 日销量走势与断货诊断")
+        
+        fig = go.Figure()
+
+        # 原始日销量柱状图
+        fig.add_trace(go.Bar(
+            x=daily_summary['Date'],
+            y=daily_summary['Units Sold'],
+            name='单日销量',
+            marker_color='#94A3B8'
+        ))
+
+        # 14日移动平均线
+        fig.add_trace(go.Scatter(
+            x=daily_summary['Date'],
+            y=daily_summary['14D_Avg'],
+            name='14日移动平均 (14D Avg)',
+            line=dict(color='#2563EB', width=3)
+        ))
+
+        # 30日移动平均线
+        fig.add_trace(go.Scatter(
+            x=daily_summary['Date'],
+            y=daily_summary['30D_Avg'],
+            name='30日趋势线 (30D Avg)',
+            line=dict(color='#DC2626', width=2, dash='dash')
+        ))
+
+        fig.update_layout(
+            hovermode="x unified",
+            xaxis_title="日期",
+            yaxis_title="销量 (Units)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
-        if response.status_code == 200:
-            data = response.json()
-            product = data.get("data", {}).get("product")
-            if not product:
-                return None, "GraphQL 接口中未查询到此商品（可能商品 ID 无效或已下架）"
+        st.plotly_chart(fig, use_container_width=True)
 
-            agg = (
-                product.get("reviews", {})
-                .get("ratingsReviews", {})
-                .get("aggregate", {})
-            )
-            total = agg.get("reviewCount", 0)
-            dist_list = agg.get("ratingDistribution") or []
+        # 5. 渠道拆分与排查
+        if 'Channel' in sku_data.columns and len(sku_data['Channel'].unique()) > 1:
+            st.subheader("🏬 渠道销量构成分析")
+            channel_df = sku_data.groupby(['Channel'])['Units Sold'].sum().reset_index()
+            fig_pie = px.pie(channel_df, values='Units Sold', names='Channel', hole=0.4, title="渠道销量占比")
+            st.plotly_chart(fig_pie, use_container_width=True)
 
-            rating_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
-            for item in dist_list:
-                r = item.get("rating")
-                c = item.get("count", 0)
-                if r in rating_counts:
-                    rating_counts[r] = c
-
-            return {"total": total, "ratings": rating_counts}, None
-    except Exception as e:
-        return None, f"GraphQL 请求异常: {e}"
-
-    return None, "GraphQL 查询失败"
-
-
-def fetch_via_bazaarvoice(item_id: str):
-    """方法 2：通过 Bazaarvoice API 获取评价数据（备用）"""
-    url = "https://api.bazaarvoice.com/data/batch.json"
-    params = {
-        "passkey": "ca3E98M1vS4N6oF1e5P5k349",
-        "apiversion": "5.5",
-        "displaycode": "1360-en_us",
-        "resource.q0": "products",
-        "filter.q0": f"id:{item_id}",
-        "stats.q0": "reviews",
-    }
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://www.homedepot.com/",
-    }
-
-    try:
-        res = requests.get(url, params=params, headers=headers, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            results = (
-                data.get("BatchedResults", {})
-                .get("q0", {})
-                .get("Results", [])
-            )
-            if results:
-                review_stats = results[0].get("ReviewStatistics", {})
-                total = review_stats.get("TotalReviewCount", 0)
-                rating_counts = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
-                for dist in review_stats.get("RatingDistribution", []):
-                    val = dist.get("RatingValue")
-                    cnt = dist.get("Count", 0)
-                    if val in rating_counts:
-                        rating_counts[val] = cnt
-                return {"total": total, "ratings": rating_counts}, None
-    except Exception as e:
-        return None, f"Bazaarvoice 请求异常: {e}"
-
-    return None, "未找到数据"
-
-
-# --- Streamlit UI ---
-st.title("🛍️ Home Depot 评论星级抓取工具")
-st.markdown("输入 Home Depot 商品链接，查询 1~5 星评论分布数据。")
-
-target_url = st.text_input(
-    "商品链接 (Product URL):",
-    placeholder="https://www.homedepot.com/p/...",
-)
-
-if st.button("开始查询", type="primary"):
-    if not target_url:
-        st.warning("请先输入商品链接！")
     else:
-        item_id = extract_item_id(target_url)
-
-        if not item_id:
-            st.error("无法提取商品 ID，请确认链接格式正确。")
-        else:
-            with st.spinner("正在查询数据中..."):
-                # 优先尝试官方 GraphQL 接口
-                data, err = fetch_via_thd_graphql(item_id)
-
-                # 若 GraphQL 未查到，回退至 Bazaarvoice
-                if not data:
-                    data, err = fetch_via_bazaarvoice(item_id)
-
-                if err and not data:
-                    st.error(f"查询失败: {err}")
-                elif data:
-                    total = data["total"]
-                    ratings = data["ratings"]
-
-                    if total == 0:
-                        st.info(f"解析成功！商品 ID: `{item_id}`，该商品当前**暂无任何买家评论 (0 条)**。")
-                    else:
-                        st.success(f"解析成功！商品 ID: `{item_id}`")
-                        st.metric("总评论数", f"{total} 条")
-
-                        st.subheader("📊 星级分布明细")
-
-                        cols = st.columns(5)
-                        stars = [5, 4, 3, 2, 1]
-                        for idx, star in enumerate(stars):
-                            cols[idx].metric(f"{star} 星", f"{ratings[star]} 条")
-
-                        chart_data = {
-                            "星级": [f"{i} 星" for i in range(1, 6)],
-                            "评论数": [ratings[i] for i in range(1, 6)],
-                        }
-                        st.bar_chart(data=chart_data, x="星级", y="评论数")
+        st.warning("所选时间段内该 SKU 无销售记录。")
+else:
+    st.info("请从 Supplier Hub 导出包含 `Date`, `SKU`, `Units Sold` 的报表并在此上传。")
